@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon Oct 24 17:21:23 2022
+HECTOR Detector Module - Semblance-based Event Detection
 
+This module implements the Detector class which extends the DAS base class
+with hyperbolic semblance-based event detection capabilities. The detector
+identifies microseismic events by computing waveform coherence along geometric
+hyperbolic trajectories, independent of velocity models.
+
+Key Features:
+- Model-independent detection using hyperbolic semblance scanning
+- Numba-accelerated computations for performance
+- Automatic event clustering and SNR-based filtering
+- Visualization tools for detection results and parameter tuning
+
+Created on Mon Oct 24 17:21:23 2022
 @author: juan
 """
 import numpy as np
@@ -16,16 +28,81 @@ from numba import jit, njit, prange
 
 @jit(nopython=True)
 def sample_select(ns_window, data, dat_win, y, a, b, c, d_static):
-    
+    """
+    Extract data samples along a hyperbolic trajectory (JIT-compiled).
+
+    This function computes a hyperbola defined by parameters (a, b, c, d_static)
+    and extracts a sliding window of samples from each trace along the hyperbolic
+    curve. Uses Numba JIT compilation for performance.
+
+    Parameters
+    ----------
+    ns_window : int
+        Width of the sampling window in samples. Defines how many samples to
+        extract around each hyperbola point. Should be even for symmetric windowing.
+    data : numpy.ndarray
+        2D array of DAS data with shape (ntrs, npts).
+    dat_win : numpy.ndarray
+        Pre-allocated output array with shape (ntrs, ns_window) to store
+        extracted samples. Passed for memory efficiency.
+    y : numpy.ndarray
+        1D array of trace indices [0, 1, 2, ..., ntrs-1]. Represents spatial
+        positions along the fiber.
+    a : float
+        Hyperbola vertex width parameter. Smaller values create wider hyperbolas.
+        Controls the aperture of the hyperbolic trajectory.
+    b : float
+        Time offset parameter. Position of hyperbola vertex along time axis
+        (in samples). Typically set to (time_sample - a) for scanning.
+    c : float
+        Curvature coefficient. Smaller values create higher curvature hyperbolas.
+        Controls the steepness of the hyperbolic trajectory.
+    d_static : float
+        Lateral position parameter. Trace index of the hyperbola vertex along
+        the spatial axis. Defines where the hyperbola is centered.
+
+    Returns
+    -------
+    numpy.ndarray
+        Data window array with shape (ntrs, ns_window) containing samples
+        extracted along the hyperbola. Traces with invalid indices are zero-filled.
+
+    Notes
+    -----
+    **Hyperbola equation:**
+        x[k] = sqrt((1 + ((y[k] - d_static)/c)^2) * a^2) + b
+
+    where x[k] is the time sample index for trace k.
+
+    **Performance:**
+    - JIT compilation (nopython=True) provides ~100x speedup
+    - First call is slower due to compilation overhead
+    - Pre-allocation of dat_win avoids memory allocation in inner loop
+
+    **Error handling:**
+    - Try/except catches index out-of-bounds errors
+    - Invalid samples are zero-filled (e.g., hyperbola extends beyond data)
+
+    Examples
+    --------
+    >>> ns_window = 20
+    >>> dat_win = np.zeros((ntrs, ns_window))
+    >>> y = np.arange(ntrs)
+    >>> result = sample_select(ns_window, data, dat_win, y, a=20, b=350, c=100, d_static=500)
+    """
+
+    # Compute hyperbola: x = sqrt((1 + ((y-d)/c)^2) * a^2) + b
     x = np.sqrt( ( 1 + ( (y-d_static) /c ) **2 ) *a**2 ) + b
-    
-    # selection of samples
+
+    # Extract samples along hyperbola for each trace
     for k in range(data.shape[0]):
-        i_hyp = int(x[k])
-        
+        i_hyp = int(x[k])  # Time index for trace k
+
         try:
+            # Extract symmetric window around hyperbola point
             dat_win[k,:] = data[k,i_hyp-ns_window//2:i_hyp+ns_window//2]
         except:
+            # Zero-fill if hyperbola extends beyond data bounds
             dat_win[k,:] = 0.
 
     return dat_win
@@ -52,91 +129,279 @@ def sample_select(ns_window, data, dat_win, y, a, b, c, d_static):
 #############################################################################
 
 class Detector(DAS.DAS):
+    """
+    Semblance-based microseismic event detector for DAS data.
+
+    This class extends the DAS base class with hyperbolic semblance scanning
+    capabilities for detecting microseismic events. It implements the HECTOR
+    algorithm described in Porras et al. (2024, GJI).
+
+    The detector operates in two stages:
+    1. Waveform coherence analysis using semblance along hyperbolic trajectories
+    2. Event clustering and SNR-based filtering
+
+    Inherits all DAS class methods for data loading, preprocessing, and visualization.
+
+    Methods
+    -------
+    detector(ns_window, a, b_step, c_min, c_max, c_step, ...)
+        Main detection engine - scans data for hyperbolic coherence
+    detected_events(min_numb_detections, max_dist_detections, ...)
+        Extract events from coherence time-series
+    hyperbolae_tuning(a, b, d, c_min, c_max, c_step, ...)
+        Visualize hyperbolic trajectories for parameter tuning
+    plot_report(path_results, savefig, fig_format)
+        Generate multi-panel detection report figure
+
+    Attributes
+    ----------
+    sem : numpy.ndarray
+        2D semblance matrix with shape (n_curvatures, n_times)
+    sem_matrix : numpy.ndarray
+        3D semblance volume (if lateral search used), shape (n_curv, n_times, n_positions)
+    coh : numpy.ndarray
+        Coherence time-series (squared sum of semblance columns)
+    threshold : numpy.ndarray
+        Detection threshold array (same length as coh)
+    events : numpy.ndarray
+        Array of detected event times (in seconds)
+    curv : numpy.ndarray
+        Array of curvature coefficients used in scanning
+    b_step : int
+        Time step used in scanning (samples)
+    d_best : float
+        Best lateral position (if lateral search used)
+    """
+
     def __init__(self,file, dx, gl, fname, file_format, duration):
-        '''
-        This method describes a DAS object. The input parameters are described here
+        """
+        Initialize a Detector object by reading DAS data.
+
+        Creates a Detector instance with all DAS class functionality plus
+        semblance-based event detection capabilities.
 
         Parameters
         ----------
-        file : string
-            It is the file path + the file name, so the DAS class can read the file wherever is located.
-        dx : integer or float
-            It is the channel (or traces) separation in meters.
-        gl : integer or float
-            Corresponds to the Gauge Length in meters.
-        fname : string
-            The input file name.
-        file_format : string
-            Currently there are four accepted file formats:
-                1.'segy'
-                2. 'tdms'
-                3. 'npy' (is a numpy array as input)
-                5. 'h5'
-        duration : integer or float
-            It corresponds to the time duration of your file (in seconds).
-            In the case of 'h5' or 'npy' formats, this parameter has to be specified, otherwise an error will be raised.
-            For 'segy' or 'tdms' formats this parameter is not needed.
-                        
+        file : str
+            Full path to DAS data file (e.g., './input/data.sgy').
+        dx : float
+            Channel spacing in meters. Distance between consecutive DAS channels.
+            Typical values: 0.5-10 m.
+        gl : float
+            Gauge length in meters. Physical length over which strain is averaged.
+            Common values: 5-20 m.
+        fname : str
+            Base filename (without path/extension) for output file naming.
+            Example: 'FORGE_2022_stage3'
+        file_format : str
+            File format identifier. Options:
+            - 'segy': SEG-Y seismic format (auto-detects metadata)
+            - 'tdms': National Instruments TDMS format (auto-detects metadata)
+            - 'npy': NumPy binary array (requires duration parameter)
+            - 'h5': HDF5 format (requires duration parameter)
+        duration : float
+            Total recording duration in seconds. Required for 'npy' and 'h5'
+            formats. Not needed for 'segy' or 'tdms'.
+
         Returns
         -------
-        A DAS object.
-        '''
+        Detector
+            Detector object with DAS data loaded and ready for processing.
+
+        Examples
+        --------
+        Create detector from SEG-Y file:
+        >>> det = Detector('./input/forge.sgy', dx=1.02, gl=10.0,
+        ...                fname='forge', file_format='segy', duration=None)
+
+        Create detector from NumPy array:
+        >>> det = Detector('./input/synthetic.npy', dx=2.0, gl=10.0,
+        ...                fname='synth', file_format='npy', duration=60.0)
+
+        See Also
+        --------
+        DAS.__init__ : Base class constructor documentation
+        """
         DAS.DAS.__init__(self,file, dx, gl, fname, file_format, duration)
         
     
-    def __svd(self, arr): # Tried to compile this function but doesn't get faster
-        '''
-        SVD decomposition of data covariance matrix 
-        
-        '''
+    def __svd(self, arr):
+        """
+        Compute SVD-based coherence metric (private method, currently unused).
+
+        Calculates eigenvalue-based coherence using singular value decomposition
+        of the data covariance matrix. Can be used as alternative to semblance
+        for weighting detection strength.
+
+        Parameters
+        ----------
+        arr : numpy.ndarray
+            Data window with shape (ntrs, ns_window).
+
+        Returns
+        -------
+        float
+            Normalized coherence metric based on dominant eigenvalue.
+            Returns 0 if array is all-zero or denominator is zero.
+
+        Notes
+        -----
+        - Currently NOT used in main detection workflow (svd=False by default)
+        - Could not be compiled with Numba (no performance gain)
+        - Returns s_n = (s[0] - mean(s[1:])) / mean(s[1:])
+        - where s are sorted singular values of covariance matrix
+        """
         if arr.all()==False:
             return 0.
         else:
             u, s, v = np.linalg.svd(np.cov(arr))
-            m = s.shape[0] # number of traces
-        
-            op = np.sum(s[1:]/(m-1))
-            s_n = (s[0] - op) / op
-        
+            m = s.shape[0]  # number of traces
+
+            op = np.sum(s[1:]/(m-1))  # Mean of non-dominant eigenvalues
+            s_n = (s[0] - op) / op     # Normalized signal strength
+
             return 0. if op==0. else s_n
-    
+
     def __semblance_func(self, arr):
+        """
+        Compute semblance (waveform coherence) for a data window (private method).
+
+        The semblance function measures the coherence of waveforms across multiple
+        traces. It ranges from 0 (no coherence) to 1 (perfect coherence).
+
+        Parameters
+        ----------
+        arr : numpy.ndarray
+            Data window with shape (ntrs, ns_window) where:
+            - ntrs: Number of traces
+            - ns_window: Number of samples in window
+
+        Returns
+        -------
+        float
+            Semblance value in range [0, 1]:
+            - ~0: Random noise, no coherent signal
+            - ~1: Perfect coherence across all traces
+            Returns 1e-16 if denominator is zero (avoid division by zero).
+
+        Notes
+        -----
+        **Mathematical definition:**
+            Semblance = [sum(sum(arr, axis=0)^2)] / [ntr * sum(arr^2)]
+
+        where:
+        - Numerator: Energy of stacked traces (coherent energy)
+        - Denominator: Total energy across all traces
+
+        **Interpretation:**
+        - High semblance indicates coherent wavefront (likely seismic event)
+        - Low semblance indicates incoherent noise
+        - Independent of amplitude (normalized by total energy)
+
+        **Performance:**
+        - Operates on small windows (typically 20 samples)
+        - Called millions of times during scanning (inner loop)
+        - Vectorized numpy operations for efficiency
+
+        Examples
+        --------
+        >>> window = data[:, 100:120]  # 20-sample window
+        >>> coherence = self.__semblance_func(window)
+        >>> # coherence ~0.8 suggests coherent signal
+        """
         ntr = arr.shape[0]
-        num, den = np.sum(np.square(np.sum(arr, axis=0))), np.sum(arr**2) * ntr
+        num = np.sum(np.square(np.sum(arr, axis=0)))  # Stacked energy
+        den = np.sum(arr**2) * ntr                     # Total energy
         return 1e-16 if den==0. else num/den
     
    
     
     def hyperbolae_tuning(self, a, b, d, c_min, c_max, c_step, path_results='./report/', savefig=False, fig_format='png'):
-        '''
-        
+        """
+        Visualize hyperbolic scanning trajectories overlaid on DAS data.
+
+        This method plots a family of hyperbolic curves on top of your DAS data
+        to help you verify that your parameter choices adequately cover the events
+        of interest. Essential for parameter tuning before running the detector.
 
         Parameters
         ----------
-        a : Int or float
-            smaller this number --> the wider the hyperbola vertex is.
-        b : Int or float
-            position along the sample axis.
-        d : Int or float
-            position along the trace axis.
-        c_min : Int or float
-            Range of curvatures. The smaller the number --> the higher the curvature is.
-        c_max : Int or float
-            Range of curvatures. The bigger the number --> the smaller the curvature is.
-        c_step : Int or float
-            Step between cmin and cmax. Can be a float to have more density of hyperbolas.
-        path_results : String, optional
-            Path where to store the results. The default is './report/'.
-        savefig : Boolean, optional
-            Set it to True if you want to save the figure. The default is False.
-        fig_format : String, optional
-            Format in which to save the figure. The default is png.
+        a : float
+            Hyperbola vertex width parameter. Smaller values create wider hyperbolas.
+            Controls the aperture of the hyperbolic scanning pattern.
+            Typical range: 10-50.
+        b : float
+            Time position of hyperbola vertex along the sample axis (sample index).
+            Defines where the hyperbola apex is positioned in time.
+            Example: 375 for scanning around sample 375.
+        d : float
+            Spatial position of hyperbola vertex along the trace axis (trace index).
+            Defines where the hyperbola is centered spatially.
+            Example: 892 for centering at trace 892.
+        c_min : float
+            Minimum curvature coefficient. Smaller values = higher curvature
+            (tighter hyperbola). Start of curvature range to visualize.
+            Typical: 50-100.
+        c_max : float
+            Maximum curvature coefficient. Larger values = lower curvature
+            (flatter hyperbola). End of curvature range to visualize.
+            Typical: 200-500.
+        c_step : float
+            Step size between c_min and c_max. Controls density of plotted
+            hyperbolas. Smaller step = more hyperbolas displayed.
+            Can be fractional (e.g., 2.5) for finer visualization.
+            Typical: 5-10.
+        path_results : str, optional
+            Directory path for saving output figure. Must exist before calling.
+            Default: './report/'
+        savefig : bool, optional
+            If True, saves figure to disk. If False, displays interactively.
+            Default: False.
+        fig_format : str, optional
+            Output figure format. Options: 'png', 'pdf', 'jpg', 'svg'.
+            Default: 'png'.
 
         Returns
         -------
-        A group of hyperbolas on your data. This way you can check if with the parameters you cover the seismic event of your interest.
+        None
+            Displays matplotlib figure showing DAS data with overlaid hyperbolic
+            trajectories. Saves to file if savefig=True.
 
-        '''
+        Notes
+        -----
+        **Usage workflow:**
+        1. Run this method BEFORE calling detector() to verify parameters
+        2. Adjust c_min, c_max, a to ensure hyperbolas match event moveout
+        3. Check that hyperbolas bracket the event of interest
+        4. If hyperbolas don't fit, adjust parameters and re-run
+
+        **Parameter relationships:**
+        - Smaller `a` → wider vertex → covers more traces laterally
+        - Smaller `c` → tighter curve → matches near-field events
+        - Larger `c` → flatter curve → matches far-field events
+        - `d` should be near the center of the event spatially
+
+        **Output file:**
+        - Filename: {path_results}{fname}_hyperbola_tuning.{fig_format}
+        - Example: './report/FORGE_data_hyperbola_tuning.png'
+
+        Examples
+        --------
+        Visualize parameter space for FORGE-like data:
+        >>> det.hyperbolae_tuning(
+        ...     a=20, b=375, d=892,
+        ...     c_min=70, c_max=500, c_step=5,
+        ...     savefig=True
+        ... )
+
+        Quick interactive check:
+        >>> det.hyperbolae_tuning(a=20, b=200, d=500,
+        ...                       c_min=50, c_max=300, c_step=10)
+
+        See Also
+        --------
+        detector : Main detection method that uses these parameters
+        """
                 
         fontsize = 10
         plt.rcParams['axes.linewidth'] = 0.3
